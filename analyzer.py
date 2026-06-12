@@ -8,10 +8,14 @@ Data sources (all free, no API key, no registration required):
 """
 
 import time
+import os
+import re
+import json
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared helpers
@@ -26,18 +30,56 @@ _NASDAQ_HEADERS = {
 }
 _SEC_UA = "Mozilla/5.0 StockAnalysis chaurasiabhasker@gmail.com"
 
-# Cached CIK lookup (loaded once per process)
+# Valid US ticker symbols: 1-6 letters, optional .X / -X share-class suffix (e.g. BRK.B)
+_TICKER_RE = re.compile(r"^[A-Z]{1,6}([.\-][A-Z]{1,3})?$")
+
+_CIK_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cik_cache.json")
+_CIK_CACHE_TTL = 7 * 24 * 3600  # 1 week — SEC's ticker map changes rarely
+
+# Full per-ticker analysis cache (budget-independent data only)
+_CORE_CACHE: dict = {}
+_CORE_CACHE_TTL = 300  # 5 minutes
+
+
+def _request_with_retry(method: str, url: str, *, retries: int = 2, backoff: float = 0.6, **kwargs) -> requests.Response:
+    """requests.request with retries on connection errors and 429/5xx responses."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.request(method, url, **kwargs)
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+                continue
+            return r
+        except requests.RequestException as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))
+    raise last_exc
+
+
+# Cached CIK lookup (loaded once per process, persisted to disk)
 _CIK_MAP: dict = {}
 
 
 def _load_cik_map() -> dict:
-    """Download SEC EDGAR ticker→CIK mapping once and cache it."""
+    """Load SEC EDGAR ticker→CIK mapping from disk cache, or download once and persist it."""
     global _CIK_MAP
     if _CIK_MAP:
         return _CIK_MAP
+
+    if os.path.exists(_CIK_CACHE_FILE) and time.time() - os.path.getmtime(_CIK_CACHE_FILE) < _CIK_CACHE_TTL:
+        try:
+            with open(_CIK_CACHE_FILE) as f:
+                _CIK_MAP = json.load(f)
+            if _CIK_MAP:
+                return _CIK_MAP
+        except Exception:
+            _CIK_MAP = {}
+
     try:
-        r = requests.get(
-            "https://www.sec.gov/files/company_tickers.json",
+        r = _request_with_retry(
+            "GET", "https://www.sec.gov/files/company_tickers.json",
             headers={"User-Agent": _SEC_UA},
             timeout=20,
         )
@@ -47,6 +89,11 @@ def _load_cik_map() -> dict:
                     "cik": str(v["cik_str"]).zfill(10),
                     "name": v["title"],
                 }
+            try:
+                with open(_CIK_CACHE_FILE, "w") as f:
+                    json.dump(_CIK_MAP, f)
+            except Exception:
+                pass
     except Exception:
         pass
     return _CIK_MAP
@@ -91,21 +138,25 @@ def fetch_price_history(ticker: str, days: int = 400) -> pd.DataFrame:
     today = datetime.now()
     start = today - timedelta(days=days)
 
-    r = requests.get(
-        f"https://api.nasdaq.com/api/quote/{ticker}/historical",
-        params={
-            "assetclass": "stocks",
-            "fromdate": start.strftime("%Y-%m-%d"),
-            "limit": "400",
-            "todate": today.strftime("%Y-%m-%d"),
-            "type": "annual",
-        },
-        headers=_NASDAQ_HEADERS,
-        timeout=25,
-    )
-    r.raise_for_status()
+    def _fetch_rows(assetclass: str) -> list:
+        r = _request_with_retry(
+            "GET", f"https://api.nasdaq.com/api/quote/{ticker}/historical",
+            params={
+                "assetclass": assetclass,
+                "fromdate": start.strftime("%Y-%m-%d"),
+                "limit": "400",
+                "todate": today.strftime("%Y-%m-%d"),
+                "type": "annual",
+            },
+            headers=_NASDAQ_HEADERS,
+            timeout=25,
+        )
+        r.raise_for_status()
+        return ((r.json().get("data") or {}).get("tradesTable") or {}).get("rows") or []
 
-    rows = (r.json().get("data", {}).get("tradesTable", {}).get("rows")) or []
+    # NASDAQ's API requires the correct assetclass — stocks vs. ETFs return
+    # null "data" when queried under the wrong one, so try both.
+    rows = _fetch_rows("stocks") or _fetch_rows("etf")
     if not rows:
         raise ValueError(
             f"NASDAQ returned no price data for '{ticker}'. "
@@ -115,16 +166,18 @@ def fetch_price_history(ticker: str, days: int = 400) -> pd.DataFrame:
     records, dates = [], []
     for row in rows:
         try:
-            dates.append(pd.to_datetime(row["date"], format="%m/%d/%Y"))
-            records.append({
+            date = pd.to_datetime(row["date"], format="%m/%d/%Y")
+            record = {
                 "Open":   _clean_num(row.get("open", 0)),
                 "High":   _clean_num(row.get("high", 0)),
                 "Low":    _clean_num(row.get("low", 0)),
                 "Close":  _clean_num(row.get("close", 0)),
-                "Volume": int(str(row.get("volume", "0")).replace(",", "")),
-            })
+                "Volume": _clean_num(row.get("volume", 0)) or 0,
+            }
         except Exception:
-            pass
+            continue
+        dates.append(date)
+        records.append(record)
 
     df = pd.DataFrame(records, index=pd.DatetimeIndex(dates))
     df = df.sort_index()  # chronological order
@@ -135,8 +188,8 @@ def fetch_price_history(ticker: str, days: int = 400) -> pd.DataFrame:
 
 def fetch_current_quote(ticker: str) -> dict:
     """Fetch current price, change, volume from NASDAQ chart endpoint."""
-    r = requests.get(
-        f"https://api.nasdaq.com/api/quote/{ticker}/chart",
+    r = _request_with_retry(
+        "GET", f"https://api.nasdaq.com/api/quote/{ticker}/chart",
         params={"assetclass": "stocks"},
         headers=_NASDAQ_HEADERS,
         timeout=15,
@@ -209,8 +262,8 @@ def fetch_sec_fundamentals(ticker: str) -> dict:
         return {"company_name_sec": ticker, "sec_available": False}
 
     try:
-        r = requests.get(
-            f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+        r = _request_with_retry(
+            "GET", f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
             headers={"User-Agent": _SEC_UA},
             timeout=25,
         )
@@ -304,8 +357,8 @@ def fetch_sec_fundamentals(ticker: str) -> dict:
 def fetch_short_interest(ticker: str) -> dict:
     """Pull short-selling data from FINRA's free public API."""
     try:
-        r = requests.get(
-            "https://api.finra.org/data/group/otcMarket/name/regShoDaily",
+        r = _request_with_retry(
+            "GET", "https://api.finra.org/data/group/otcMarket/name/regShoDaily",
             params={
                 "limit": 10,
                 "securities.symbolCode": ticker,
@@ -613,6 +666,124 @@ def calculate_fundamental_score(sec: dict, short: dict, quote: dict, ind: dict) 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sentiment & Trend Scoring
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_sentiment_score(ind: dict, short: dict) -> tuple:
+    """
+    Market-sentiment proxy from short interest (crowd positioning), volume
+    (attention), and recent momentum (mood) — all data we already have.
+    """
+    score, signals = 0, []
+
+    # Short interest — contrarian positioning (0-35)
+    sp = short.get("short_pct")
+    if sp is not None:
+        if sp > 0.20:
+            score += 35
+            signals.append(("Short Interest", f"Very high short interest {sp*100:.1f}% — heavily bearish positioning, squeeze risk (FINRA)", "bullish"))
+        elif sp > 0.10:
+            score += 22
+            signals.append(("Short Interest", f"Elevated short interest {sp*100:.1f}% — crowd is split (FINRA)", "neutral"))
+        else:
+            score += 14
+            signals.append(("Short Interest", f"Low short interest {sp*100:.1f}% — limited contrarian setup (FINRA)", "neutral"))
+    else:
+        score += 14
+        signals.append(("Short Interest", "Short interest data unavailable (FINRA)", "neutral"))
+
+    # Volume — crowd attention (0-30)
+    vr = ind.get("volume_ratio", 1.0)
+    p5 = ind.get("price_change_5d", 0)
+    if vr > 1.5 and p5 > 0:
+        score += 30
+        signals.append(("Crowd Attention", f"Volume surging ({vr:.1f}x avg) alongside price gains — buying interest building", "bullish"))
+    elif vr > 1.5 and p5 <= 0:
+        score += 8
+        signals.append(("Crowd Attention", f"Volume surging ({vr:.1f}x avg) on a falling price — selling pressure", "bearish"))
+    elif vr < 0.7:
+        score += 12
+        signals.append(("Crowd Attention", f"Below-average volume ({vr:.1f}x avg) — low conviction either way", "neutral"))
+    else:
+        score += 18
+        signals.append(("Crowd Attention", f"Normal trading activity ({vr:.1f}x avg)", "neutral"))
+
+    # Momentum mood (0-35)
+    p20 = ind.get("price_change_20d", 0)
+    if p5 > 3 and p20 > 5:
+        score += 35
+        signals.append(("Momentum Mood", f"Strong recent gains (+{p5:.1f}% 5d, +{p20:.1f}% 20d) — bullish mood", "bullish"))
+    elif p5 > 0 and p20 > 0:
+        score += 25
+        signals.append(("Momentum Mood", f"Modest recent gains (+{p5:.1f}% 5d, +{p20:.1f}% 20d)", "bullish"))
+    elif p5 < -3 and p20 < -5:
+        score += 5
+        signals.append(("Momentum Mood", f"Sharp recent losses ({p5:.1f}% 5d, {p20:.1f}% 20d) — bearish mood", "bearish"))
+    else:
+        score += 15
+        signals.append(("Momentum Mood", f"Mixed recent performance ({p5:.1f}% 5d, {p20:.1f}% 20d)", "neutral"))
+
+    return min(score, 100), signals
+
+
+def calculate_trend_score(ind: dict) -> tuple:
+    """Longer-horizon trend: 52-week positioning, moving-average stack, and momentum consistency."""
+    score, signals = 0, []
+    cur = ind["current_price"]
+    hi, lo = ind.get("high_52w"), ind.get("low_52w")
+    s20, s50, s200 = ind.get("sma_20"), ind.get("sma_50"), ind.get("sma_200")
+
+    # 52-week range position (0-40)
+    if hi and lo and hi > lo:
+        pos = (cur - lo) / (hi - lo)
+        if pos > 0.85:
+            score += 28
+            signals.append(("52-Week Range", f"Near 52-week high ({pos*100:.0f}% of range) — strong long-term uptrend, watch for resistance", "bullish"))
+        elif pos > 0.5:
+            score += 40
+            signals.append(("52-Week Range", f"Upper half of 52-week range ({pos*100:.0f}%) — healthy uptrend with room to run", "bullish"))
+        elif pos > 0.2:
+            score += 22
+            signals.append(("52-Week Range", f"Lower half of 52-week range ({pos*100:.0f}%) — basing or still in a downtrend", "neutral"))
+        else:
+            score += 10
+            signals.append(("52-Week Range", f"Near 52-week low ({pos*100:.0f}% of range) — long-term downtrend", "bearish"))
+    else:
+        score += 18
+        signals.append(("52-Week Range", "Insufficient history for 52-week range", "neutral"))
+
+    # Moving-average trend stack (0-35)
+    if s20 and s50 and s200:
+        if s20 > s50 > s200:
+            score += 35
+            signals.append(("Trend Direction", "SMA20 > SMA50 > SMA200 — established uptrend across all timeframes", "bullish"))
+        elif s20 < s50 < s200:
+            score += 8
+            signals.append(("Trend Direction", "SMA20 < SMA50 < SMA200 — established downtrend across all timeframes", "bearish"))
+        else:
+            score += 20
+            signals.append(("Trend Direction", "Mixed moving-average stack — short and long-term trends disagree", "neutral"))
+    else:
+        score += 18
+        signals.append(("Trend Direction", "Not enough history for full moving-average trend", "neutral"))
+
+    # Multi-timeframe momentum consistency (0-25)
+    p1, p5, p20 = ind.get("price_change_1d", 0), ind.get("price_change_5d", 0), ind.get("price_change_20d", 0)
+    pos_count = sum(1 for p in (p1, p5, p20) if p > 0)
+    if pos_count == 3:
+        score += 25
+        signals.append(("Momentum Consistency", "Positive across 1d, 5d and 20d — trend is accelerating", "bullish"))
+    elif pos_count == 0:
+        score += 5
+        signals.append(("Momentum Consistency", "Negative across 1d, 5d and 20d — trend is deteriorating", "bearish"))
+    else:
+        score += 13
+        signals.append(("Momentum Consistency", "Mixed momentum across timeframes", "neutral"))
+
+    return min(score, 100), signals
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Confidence & Strategy
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -628,6 +799,42 @@ def get_confidence(score: float) -> dict:
                 "desc": "Some positive signals — limited/scaled entry recommended"}
     return     {"level": "10%",  "label": "SPECULATIVE",   "color": "#ff4444", "bg": "#330000",
                 "desc": "Mixed/weak signals — very small speculative position only"}
+
+
+def build_recommendation(ticker, company_name, tech, fund, sentiment, trend,
+                          tech_signals, fund_signals, sentiment_signals, trend_signals) -> dict:
+    """
+    Synthesize technical, fundamental, sentiment and trend scores into a single
+    written recommendation with its own confidence rating.
+    """
+    overall = round(tech * 0.30 + fund * 0.25 + trend * 0.25 + sentiment * 0.20, 1)
+    conf = get_confidence(overall)
+
+    all_signals = tech_signals + fund_signals + trend_signals + sentiment_signals
+    bullish = [s for s in all_signals if s[2] == "bullish"]
+    bearish = [s for s in all_signals if s[2] == "bearish"]
+
+    parts = [
+        f"{company_name} ({ticker}) scores {overall}/100 overall — "
+        f"Technical {tech}/100, Fundamental {fund}/100, Trend {trend}/100, Sentiment {sentiment}/100."
+    ]
+    if bullish:
+        parts.append("Supporting the case: " + "; ".join(s[1] for s in bullish[:3]) + ".")
+    if bearish:
+        parts.append("Risks to weigh: " + "; ".join(s[1] for s in bearish[:2]) + ".")
+    parts.append(
+        f"{len(bullish)} bullish vs {len(bearish)} bearish signals out of {len(all_signals)} — "
+        f"overall confidence {conf['level']} ({conf['label']})."
+    )
+
+    return {
+        "overall_score":  overall,
+        "confidence":     conf,
+        "narrative":      " ".join(parts),
+        "bullish_count":  len(bullish),
+        "bearish_count":  len(bearish),
+        "total_signals":  len(all_signals),
+    }
 
 
 def calculate_targets(hist: pd.DataFrame, ind: dict, conf: dict) -> dict:
@@ -691,11 +898,11 @@ def build_strategy(ticker, cur_price, conf, tgts, budget):
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def analyze_stock(ticker: str, budget: float = 10000) -> dict:
-    ticker = ticker.upper().strip()
-    if not ticker:
-        return {"error": "Empty ticker", "ticker": ticker}
-
+def _analyze_core(ticker: str) -> dict:
+    """
+    Fetch market data and compute technical/fundamental analysis for a ticker.
+    Everything returned here is budget-independent, so it's safe to cache.
+    """
     # ── 1. Price History (NASDAQ) ──────────────────────────────────────────
     try:
         hist = fetch_price_history(ticker, days=400)
@@ -744,9 +951,19 @@ def analyze_stock(ticker: str, budget: float = 10000) -> dict:
     combined = round(tech_score * 0.60 + fund_score * 0.40, 1)
     conf     = get_confidence(combined)
 
-    # ── 8. Price Targets + Strategy ───────────────────────────────────────
-    tgts     = calculate_targets(hist, ind, conf)
-    strategy = build_strategy(ticker, current_price, conf, tgts, budget)
+    # ── 7b. Sentiment & Trend Scoring ─────────────────────────────────────
+    sentiment_score, sentiment_signals = calculate_sentiment_score(ind, short)
+    trend_score, trend_signals = calculate_trend_score(ind)
+
+    # ── 7c. AI Recommendation ─────────────────────────────────────────────
+    recommendation = build_recommendation(
+        ticker, company_name, round(tech_score, 1), round(fund_score, 1),
+        round(sentiment_score, 1), round(trend_score, 1),
+        tech_signals, fund_signals, sentiment_signals, trend_signals,
+    )
+
+    # ── 8. Price Targets ──────────────────────────────────────────────────
+    tgts = calculate_targets(hist, ind, conf)
 
     # ── 9. Chart Data ─────────────────────────────────────────────────────
     tail = hist.tail(90)
@@ -763,20 +980,16 @@ def analyze_stock(ticker: str, budget: float = 10000) -> dict:
     chart_sma50 = [round(float(v), 2) if not np.isnan(v) else None
                    for v in close_full.rolling(50).mean().tail(90).tolist()]
 
+    market_cap_val = (sec.get("shares_outstanding") or 0) * current_price or None
+
     return {
         "ticker":        ticker,
         "company_name":  company_name,
-        "sector":        sec.get("sector", "N/A"),
-        "industry":      sec.get("industry", "N/A"),
         "exchange":      quote.get("exchange", ""),
         "current_price": round(current_price, 2),
-        "market_cap":    _fmt_large(
-            (sec.get("shares_outstanding") or 0) * current_price or None
-        ),
-        "beta":          None,   # not available without Yahoo Finance
+        "market_cap":    _fmt_large(market_cap_val),
         "technical":     ind,
         "fundamental":   {
-            # SEC EDGAR data
             "revenue_fmt":      sec.get("revenue_fmt", "N/A"),
             "revenue_growth":   sec.get("revenue_growth"),
             "net_income_fmt":   sec.get("net_income_fmt", "N/A"),
@@ -786,33 +999,25 @@ def analyze_stock(ticker: str, budget: float = 10000) -> dict:
             "profit_margin":    sec.get("profit_margin"),
             "gross_margin":     sec.get("gross_margin"),
             "debt_to_equity":   sec.get("debt_to_equity"),
-            "pe_ratio":         None,
-            "forward_pe":       None,
             "short_pct_float":  short.get("short_pct"),
-            "short_ratio":      None,
-            "inst_ownership":   None,
-            "rec_mean":         None,
-            "num_analysts":     0,
-            "target_mean":      None,
-            "target_high":      None,
-            "target_low":       None,
-            "total_revenue_fmt": sec.get("revenue_fmt", "N/A"),
-            "market_cap_fmt":   _fmt_large(
-                (sec.get("shares_outstanding") or 0) * current_price or None
-            ),
+            "market_cap_fmt":   _fmt_large(market_cap_val),
             "sec_available":    sec.get("sec_available", False),
             "cik":              sec.get("cik"),
             "short_pct_display": short.get("short_pct_display", "N/A"),
             "short_vol_date":   short.get("last_date", ""),
         },
-        "tech_signals":  tech_signals,
-        "fund_signals":  fund_signals,
-        "tech_score":    round(tech_score, 1),
-        "fund_score":    round(fund_score, 1),
-        "combined_score": combined,
-        "confidence":    conf,
+        "tech_signals":     tech_signals,
+        "fund_signals":     fund_signals,
+        "sentiment_signals": sentiment_signals,
+        "trend_signals":    trend_signals,
+        "tech_score":       round(tech_score, 1),
+        "fund_score":       round(fund_score, 1),
+        "sentiment_score":  round(sentiment_score, 1),
+        "trend_score":      round(trend_score, 1),
+        "combined_score":   combined,
+        "confidence":       conf,
+        "recommendation":   recommendation,
         "targets":       tgts,
-        "strategy":      strategy,
         "chart_dates":   chart_dates,
         "chart_prices":  chart_prices,
         "chart_volumes": chart_volumes,
@@ -821,6 +1026,143 @@ def analyze_stock(ticker: str, budget: float = 10000) -> dict:
         "analyzed_at":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "data_sources":  "NASDAQ (prices) + SEC EDGAR (fundamentals) + FINRA (short interest)",
     }
+
+
+def _analyze_core_cached(ticker: str) -> dict:
+    now = time.time()
+    cached = _CORE_CACHE.get(ticker)
+    if cached and now - cached[0] < _CORE_CACHE_TTL:
+        return cached[1]
+    result = _analyze_core(ticker)
+    if "error" not in result:
+        _CORE_CACHE[ticker] = (now, result)
+    return result
+
+
+def analyze_stock(ticker: str, budget: float = 10000) -> dict:
+    ticker = ticker.upper().strip()
+    if not ticker:
+        return {"error": "Empty ticker", "ticker": ticker}
+    if not _TICKER_RE.match(ticker):
+        return {"error": f"'{ticker}' doesn't look like a valid ticker symbol", "ticker": ticker}
+
+    core = _analyze_core_cached(ticker)
+    if "error" in core:
+        return core
+
+    strategy = build_strategy(ticker, core["current_price"], core["confidence"], core["targets"], budget)
+    return {**core, "strategy": strategy}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Similar Ticker Suggestions — curated sector/theme peer groups
+# ─────────────────────────────────────────────────────────────────────────────
+
+SECTOR_PEER_GROUPS = {
+    "space_defense":     ["RDW", "RKLB", "ASTS", "LUNR", "PL", "KTOS", "AVAV"],
+    "drone_robotics":    ["ONDS", "AVAV", "KTOS", "RCAT", "AIRO", "IRBT"],
+    "biotech_clinical":  ["RLAY", "ARVN", "KROS", "IOVA", "CRSP", "BEAM", "NTLA"],
+    "ai_semis":          ["NVDA", "AMD", "SMCI", "ARM", "SOUN", "BBAI", "AI", "PLTR"],
+    "quantum_computing": ["IONQ", "RGTI", "QBTS", "QUBT"],
+    "nuclear_smr":       ["OKLO", "SMR", "LEU", "CCJ", "NNE", "BWXT"],
+    "ev_battery":        ["RIVN", "LCID", "QS", "CHPT", "FREY"],
+    "crypto_mining":     ["MARA", "RIOT", "CLSK", "WULF", "BITF", "CORZ"],
+    "fintech_payments":  ["SOFI", "AFRM", "UPST", "PYPL", "SQ"],
+    "mega_cap_tech":     ["AAPL", "MSFT", "GOOGL", "META", "AMZN", "NVDA"],
+    "semiconductors":    ["NVDA", "AMD", "INTC", "AVGO", "QCOM", "MU", "TXN", "ARM"],
+    "software_saas":     ["MSFT", "CRM", "ADBE", "NOW", "ORCL", "SNOW", "PLTR", "PANW"],
+    "banks_financials":  ["JPM", "BAC", "WFC", "GS", "MS", "C", "AXP"],
+    "healthcare_pharma": ["JNJ", "PFE", "MRK", "ABBV", "LLY", "UNH", "BMY"],
+    "energy_oil_gas":    ["XOM", "CVX", "COP", "OXY", "SLB", "EOG"],
+    "retail_consumer":   ["WMT", "TGT", "COST", "HD", "LOW", "NKE", "SBUX"],
+    "airlines_travel":   ["DAL", "UAL", "AAL", "LUV", "ABNB", "BKNG"],
+    "streaming_media":   ["NFLX", "DIS", "WBD", "ROKU", "PARA"],
+    "auto_ev":           ["TSLA", "F", "GM", "TM", "RIVN", "LCID"],
+    "social_internet":   ["META", "GOOGL", "SNAP", "PINS", "RDDT"],
+    "cloud_ecommerce":   ["AMZN", "SHOP", "MELI", "EBAY", "ETSY"],
+}
+
+# Broad pool of liquid large-caps used when an input ticker isn't covered by
+# any curated sector group above (e.g. V, KO, PG, GOOG, ETFs).
+_GENERAL_MARKET_POOL = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
+    "JPM", "V", "JNJ", "WMT", "XOM", "HD", "DIS", "NFLX",
+    "AMD", "CRM", "COST", "BAC", "PG",
+]
+
+
+def _build_reverse_map(groups: dict) -> dict:
+    reverse: dict = {}
+    for group, members in groups.items():
+        for t in members:
+            reverse.setdefault(t, []).append(group)
+    return reverse
+
+
+_TICKER_TO_GROUPS = _build_reverse_map(SECTOR_PEER_GROUPS)
+
+
+def find_similar_tickers(input_tickers: list, budget: float = 10000, max_suggestions: int = 2, max_candidates: int = 10) -> list:
+    """
+    Given a list of already-analyzed tickers, suggest other tickers from the
+    same sector/theme group that currently look attractive for a short-term
+    trade. Ranked by a "short-term score" weighted toward technicals and
+    trend/momentum (since short-term trades live and die on timing), with
+    sentiment and fundamentals as secondary factors.
+    """
+    input_set = {t.upper().strip() for t in input_tickers}
+
+    candidates: dict = {}  # candidate ticker -> set of related input tickers
+    for t in input_set:
+        for group in _TICKER_TO_GROUPS.get(t, []):
+            for peer in SECTOR_PEER_GROUPS[group]:
+                if peer in input_set:
+                    continue
+                candidates.setdefault(peer, set()).add(t)
+
+    # Fallback: if the ticker(s) entered aren't covered by any curated sector
+    # group (e.g. V, KO, PG, GOOG, ETFs), suggest from a broad pool of liquid
+    # large-caps so the "Similar Opportunities" section is never empty.
+    if not candidates:
+        for peer in _GENERAL_MARKET_POOL:
+            if peer not in input_set:
+                candidates[peer] = set(input_set)
+
+    cand_items = list(candidates.items())[:max_candidates]
+
+    with ThreadPoolExecutor(max_workers=min(8, len(cand_items))) as ex:
+        analyzed = list(ex.map(lambda kv: (kv[0], kv[1], analyze_stock(kv[0], budget)), cand_items))
+
+    scored = []
+    for cand, related, result in analyzed:
+        if "error" in result:
+            continue
+        tech, fund = result["tech_score"], result["fund_score"]
+        trend, sentiment = result["trend_score"], result["sentiment_score"]
+        short_term_score = round(tech * 0.4 + trend * 0.3 + sentiment * 0.2 + fund * 0.1, 1)
+        all_signals = (result["tech_signals"] + result["fund_signals"]
+                       + result["trend_signals"] + result["sentiment_signals"])
+        bullish = [s for s in all_signals if s[2] == "bullish"]
+        reason = bullish[0][1] if bullish else (all_signals[0][1] if all_signals else "")
+        scored.append({
+            "ticker":           cand,
+            "company_name":     result["company_name"],
+            "current_price":    result["current_price"],
+            "tech_score":       tech,
+            "fund_score":       fund,
+            "trend_score":      trend,
+            "sentiment_score":  sentiment,
+            "combined_score":   result["combined_score"],
+            "short_term_score": short_term_score,
+            "confidence":       result["confidence"],
+            "price_change_5d":  result["technical"]["price_change_5d"],
+            "reason":           reason,
+            "related_to":       sorted(related),
+            "strategy":         result["strategy"],
+        })
+
+    scored.sort(key=lambda x: x["short_term_score"], reverse=True)
+    return scored[:max_suggestions]
 
 
 def test_connectivity() -> dict:

@@ -345,6 +345,30 @@
   .signal-name { font-size: 11px; font-weight: 700; color: var(--text); }
   .signal-desc { font-size: 11px; color: var(--muted); margin-top: 1px; line-height: 1.3; }
 
+  /* AI RECOMMENDATION */
+  .recommendation-section {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #1a1430 0%, var(--panel) 100%);
+  }
+  .rec-top {
+    display: flex;
+    gap: 24px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .rec-meters { flex: 1; min-width: 280px; }
+  .rec-narrative {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--text);
+  }
+
   /* CHART */
   .chart-section {
     padding: 20px 24px;
@@ -444,6 +468,46 @@
   }
   .summary-table tr:last-child td { border-bottom: none; }
   .summary-table tr:hover td { background: #ffffff05; }
+
+  /* SIMILAR OPPORTUNITIES */
+  .similar-section {
+    margin-top: 28px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .similar-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    padding: 20px 24px;
+  }
+  .similar-card {
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .similar-ticker { font-size: 18px; font-weight: 700; color: var(--accent); letter-spacing: 1px; }
+  .similar-company { color: var(--text); font-size: 12px; margin-top: 2px; }
+  .similar-price { font-size: 13px; margin-top: 8px; font-weight: 600; }
+  .similar-score { font-size: 11px; margin-top: 8px; font-weight: 700; }
+  .similar-conf { font-size: 11px; margin-top: 2px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
+  .similar-reason { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.4; }
+  .similar-invest {
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: #00ff8810;
+    border: 1px solid #00ff8830;
+    border-radius: 6px;
+  }
+  .similar-invest-amount { font-size: 13px; font-weight: 700; color: var(--green); }
+  .similar-invest-detail { font-size: 10px; color: var(--muted); margin-top: 3px; line-height: 1.4; }
+  .similar-related {
+    font-size: 10px; color: var(--muted); margin-top: 10px;
+    border-top: 1px solid var(--border); padding-top: 8px;
+  }
 </style>
 </head>
 <body>
@@ -494,6 +558,7 @@
 <section class="results" id="results">
   <div class="results-grid" id="resultsGrid"></div>
   <div class="summary-section" id="summarySection" style="display:none"></div>
+  <div class="similar-section" id="similarSection" style="display:none"></div>
 </section>
 
 <script>
@@ -705,6 +770,46 @@ function renderCard(r) {
       </div>
     </div>
 
+    <!-- AI RECOMMENDATION -->
+    <div class="recommendation-section">
+      <div class="panel-title">AI Recommendation — Technical + Fundamental + Trend + Sentiment</div>
+      <div class="rec-top">
+        <div class="rec-meters">
+          <div class="score-row">
+            <div class="score-label">Trend Score</div>
+            <div class="score-bar-bg">
+              <div class="score-bar-fill" style="width:${r.trend_score}%;background:${scoreColor(r.trend_score)}"></div>
+            </div>
+            <div class="score-val" style="color:${scoreColor(r.trend_score)}">${r.trend_score}</div>
+          </div>
+          <div class="score-row">
+            <div class="score-label">Sentiment Score</div>
+            <div class="score-bar-bg">
+              <div class="score-bar-fill" style="width:${r.sentiment_score}%;background:${scoreColor(r.sentiment_score)}"></div>
+            </div>
+            <div class="score-val" style="color:${scoreColor(r.sentiment_score)}">${r.sentiment_score}</div>
+          </div>
+          <div class="score-row">
+            <div class="score-label">Overall (AI)</div>
+            <div class="score-bar-bg">
+              <div class="score-bar-fill" style="width:${r.recommendation.overall_score}%;background:${scoreColor(r.recommendation.overall_score)}"></div>
+            </div>
+            <div class="score-val" style="color:${scoreColor(r.recommendation.overall_score)}">${r.recommendation.overall_score}</div>
+          </div>
+        </div>
+        <div class="confidence-badge" style="color:${r.recommendation.confidence.color};border-color:${r.recommendation.confidence.color}33;background:${r.recommendation.confidence.bg}">
+          <div class="conf-level">${r.recommendation.confidence.level}</div>
+          <div class="conf-label" style="color:${r.recommendation.confidence.color}">${r.recommendation.confidence.label}</div>
+          <div class="conf-desc">${r.recommendation.bullish_count} bullish / ${r.recommendation.bearish_count} bearish of ${r.recommendation.total_signals} signals</div>
+        </div>
+      </div>
+      <div class="rec-narrative">${r.recommendation.narrative}</div>
+      <div class="signals-columns" style="margin-top:14px">
+        ${renderSignals(r.trend_signals, 'Trend Signals')}
+        ${renderSignals(r.sentiment_signals, 'Sentiment Signals')}
+      </div>
+    </div>
+
     <!-- CHART -->
     <div class="chart-section">
       <div class="panel-title">Price Chart (90 Days) — with SMA20 &amp; SMA50</div>
@@ -750,10 +855,6 @@ function renderCard(r) {
           <div class="metric-key">Bollinger Lower / Upper</div>
           <div class="metric-val">$${fmt(tgt.bb_lower)} / $${fmt(tgt.bb_upper)}</div>
         </div>
-        ${tgt.analyst_target ? `<div class="metric-row">
-          <div class="metric-key">Analyst Price Target</div>
-          <div class="metric-val green">$${fmt(tgt.analyst_target)}</div>
-        </div>` : ''}
       </div>
 
       <div class="strategy-panel">
@@ -834,6 +935,32 @@ function renderSummary(results) {
 }
 
 function strat(r) { return r.strategy; }
+
+function renderSimilar(items) {
+  if (!items || !items.length) return '';
+
+  const cards = items.map(s => {
+    const chgClass = s.price_change_5d >= 0 ? 'green' : 'red';
+    const chgSign = s.price_change_5d >= 0 ? '+' : '';
+    return `<div class="similar-card">
+      <div class="similar-ticker">${s.ticker}</div>
+      <div class="similar-company">${s.company_name}</div>
+      <div class="similar-price">$${fmt(s.current_price)} <span class="${chgClass}">(${chgSign}${fmt(s.price_change_5d,2)}% 5d)</span></div>
+      <div class="similar-score" style="color:${scoreColor(s.short_term_score)}">Short-Term Score: ${s.short_term_score}</div>
+      <div class="similar-conf" style="color:${s.confidence.color}">${s.confidence.level} — ${s.confidence.label}</div>
+      <div class="similar-reason">${s.reason}</div>
+      <div class="similar-invest">
+        <div class="similar-invest-amount">Invest $${fmt(s.strategy.actual_investment)} (${s.strategy.quantity} sh &bull; ${s.strategy.alloc_pct}% of budget)</div>
+        <div class="similar-invest-detail">${s.strategy.entry_strategy}</div>
+        <div class="similar-invest-detail">Target $${fmt(s.strategy.target)} &bull; Stop $${fmt(s.strategy.stop_loss)}</div>
+      </div>
+      <div class="similar-related">Related to: ${s.related_to.join(', ')}</div>
+    </div>`;
+  }).join('');
+
+  return `<div class="summary-title">SIMILAR OPPORTUNITIES — SHORT-TERM CANDIDATES</div>
+    <div class="similar-grid">${cards}</div>`;
+}
 
 function buildChart(id, dates, prices, sma20, sma50, currentPrice) {
   const canvas = document.getElementById('chart-' + id);
@@ -955,10 +1082,11 @@ document.getElementById('analyzeForm').addEventListener('submit', async (e) => {
       body: JSON.stringify({ tickers, budget })
     });
     const data = await resp.json();
+    const items = data.results || [];
 
-    grid.innerHTML = data.map(r => r.error ? renderError(r) : renderCard(r)).join('');
+    grid.innerHTML = items.map(r => r.error ? renderError(r) : renderCard(r)).join('');
 
-    const summaryHtml = renderSummary(data);
+    const summaryHtml = renderSummary(items);
     if (summaryHtml) {
       summary.innerHTML = summaryHtml;
       summary.style.display = 'block';
@@ -966,11 +1094,20 @@ document.getElementById('analyzeForm').addEventListener('submit', async (e) => {
       summary.style.display = 'none';
     }
 
+    const similarSection = document.getElementById('similarSection');
+    const similarHtml = renderSimilar(data.similar);
+    if (similarHtml) {
+      similarSection.innerHTML = similarHtml;
+      similarSection.style.display = 'block';
+    } else {
+      similarSection.style.display = 'none';
+    }
+
     results.classList.add('active');
 
     // Build charts after DOM is ready
     requestAnimationFrame(() => {
-      data.forEach(r => {
+      items.forEach(r => {
         if (!r.error) {
           const id = r.ticker.replace(/[^a-zA-Z0-9]/g, '');
           buildChart(id, r.chart_dates, r.chart_prices, r.chart_sma20, r.chart_sma50, r.current_price);
